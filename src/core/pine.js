@@ -402,29 +402,49 @@ export async function compile() {
   };
 }
 
+const READ_MARKERS_JS = `
+  (function() {
+    var m = ${FIND_MONACO};
+    if (!m) return [];
+    var model = m.editor.getModel();
+    if (!model) return [];
+    var markers = m.env.editor.getModelMarkers({ resource: model.uri });
+    return markers.map(function(mk) {
+      return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
+    });
+  })()
+`;
+
+// Monaco MarkerSeverity: Hint = 1, Info = 2, Warning = 4, Error = 8.
+const MARKER_LEVELS = { 1: 'hint', 2: 'info', 4: 'warning', 8: 'error' };
+
+/**
+ * Splits Monaco editor markers into real compile errors (severity 8) and
+ * everything else (warnings / info / hints), which don't stop the script running.
+ */
+export function classifyMarkers(markers) {
+  const errors = [];
+  const warnings = [];
+  for (const mk of markers || []) {
+    const item = { ...mk, level: MARKER_LEVELS[mk.severity] || 'unknown' };
+    if (mk.severity >= 8) errors.push(item);
+    else warnings.push(item);
+  }
+  return {
+    has_errors: errors.length > 0,
+    error_count: errors.length,
+    warning_count: warnings.length,
+    errors,
+    warnings,
+  };
+}
+
 export async function getErrors() {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const errors = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return [];
-      var model = m.editor.getModel();
-      if (!model) return [];
-      var markers = m.env.editor.getModelMarkers({ resource: model.uri });
-      return markers.map(function(mk) {
-        return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
-      });
-    })()
-  `);
-
-  return {
-    success: true,
-    has_errors: errors?.length > 0,
-    error_count: errors?.length || 0,
-    errors: errors || [],
-  };
+  const markers = await evaluate(READ_MARKERS_JS);
+  return { success: true, ...classifyMarkers(markers) };
 }
 
 export async function save() {
@@ -539,18 +559,7 @@ export async function smartCompile() {
 
   await new Promise(r => setTimeout(r, 2500));
 
-  const errors = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return [];
-      var model = m.editor.getModel();
-      if (!model) return [];
-      var markers = m.env.editor.getModelMarkers({ resource: model.uri });
-      return markers.map(function(mk) {
-        return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
-      });
-    })()
-  `);
+  const markers = await evaluate(READ_MARKERS_JS);
 
   const studiesAfter = await evaluate(`
     (function() {
@@ -567,8 +576,7 @@ export async function smartCompile() {
   return {
     success: true,
     button_clicked: buttonClicked || 'keyboard_shortcut',
-    has_errors: errors?.length > 0,
-    errors: errors || [],
+    ...classifyMarkers(markers),
     study_added: studyAdded,
     editor_script: scriptBefore,
     ...savedScriptNote(buttonClicked, scriptBefore),

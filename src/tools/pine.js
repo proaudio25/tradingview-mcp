@@ -25,8 +25,10 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_save', 'Save the current Pine Script (Ctrl+S)', {}, async () => {
-    try { return jsonResult(await core.save()); }
+  server.tool('pine_save', 'Save the current Pine Script (Ctrl+S). For a new script, fills and confirms the "Save Script" name dialog (default name = the script title) and returns saved_as.', {
+    name: z.string().optional().describe('Name for a new script (default: the title TradingView pre-fills from strategy()/indicator()). Ignored for an already-saved script.'),
+  }, async ({ name }) => {
+    try { return jsonResult(await core.save({ name })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

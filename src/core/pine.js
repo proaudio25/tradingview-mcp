@@ -447,40 +447,131 @@ export async function getErrors() {
   return { success: true, ...classifyMarkers(markers) };
 }
 
-export async function save() {
-  const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor.');
+// Button labels of the "Save Script" name dialog across UI languages. The old
+// code matched only English "Save", so in e.g. the Korean UI ("저장") the dialog
+// was left open while pine_save still reported success.
+const SAVE_LABEL_RE = '^(save|저장|保存|保存する|speichern|enregistrer|guardar|salvar|salva|сохранить|kaydet|zapisz|opslaan)$';
+const CANCEL_LABEL_RE = '^(cancel|취소|キャンセル|取消|abbrechen|annuler|cancelar|annulla|отмена|iptal|anuluj|annuleren)$';
 
-  const scriptBefore = await getEditorScript();
-  const c = await getClient();
-  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
-  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 's', code: 'KeyS' });
-  await new Promise(r => setTimeout(r, 800));
+export function isSaveLabel(text) { return new RegExp(SAVE_LABEL_RE, 'i').test(String(text ?? '').trim()); }
+export function isCancelLabel(text) { return new RegExp(CANCEL_LABEL_RE, 'i').test(String(text ?? '').trim()); }
 
-  // Handle "Save Script" name dialog that appears for new/unsaved scripts
-  const dialogHandled = await evaluate(`
+// Finds the save-name dialog: a visible text input whose nearest container
+// (outside the Monaco editor) holds both a save and a cancel button. With
+// click=true it optionally sets the name (React-controlled input) and clicks save.
+// Returns { found, name, clicked? }.
+function saveDialogJs({ click = false, name = null } = {}) {
+  return `
+    /*save-dialog:${click ? 'click' : 'find'}*/
     (function() {
-      var saveBtn = null;
-      var btns = document.querySelectorAll('button');
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (text === 'Save' && btns[i].offsetParent !== null) {
-          // Check if it's in a dialog (not the Pine Editor save button)
-          var parent = btns[i].closest('[class*="dialog"], [class*="modal"], [class*="popup"], [role="dialog"]');
-          if (parent) { saveBtn = btns[i]; break; }
+      var saveRe = new RegExp(${JSON.stringify(SAVE_LABEL_RE)}, 'i');
+      var cancelRe = new RegExp(${JSON.stringify(CANCEL_LABEL_RE)}, 'i');
+      var newName = ${JSON.stringify(name)};
+      function vis(el) { return el && el.offsetParent !== null; }
+      var inputs = document.querySelectorAll('input');
+      for (var i = 0; i < inputs.length; i++) {
+        var inp = inputs[i];
+        if (!vis(inp) || (inp.type && inp.type !== 'text')) continue;
+        var box = inp;
+        for (var d = 0; d < 10 && box.parentElement; d++) {
+          box = box.parentElement;
+          if (box.querySelector('.monaco-editor')) break;
+          var btns = box.querySelectorAll('button'), save = null, cancel = null;
+          for (var b = 0; b < btns.length; b++) {
+            if (!vis(btns[b])) continue;
+            var t = btns[b].textContent.trim();
+            if (!save && saveRe.test(t)) save = btns[b];
+            else if (!cancel && cancelRe.test(t)) cancel = btns[b];
+          }
+          if (save && cancel) {
+            if (!${click}) return { found: true, name: inp.value };
+            if (newName) {
+              var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+              setter.call(inp, newName);
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            save.click();
+            return { found: true, name: inp.value, clicked: true };
+          }
         }
       }
-      if (saveBtn) { saveBtn.click(); return true; }
-      return false;
+      return { found: false };
     })()
-  `);
+  `;
+}
 
-  if (dialogHandled) await new Promise(r => setTimeout(r, 500));
+const scriptRef = (s) => (s ? { name: s.name, script_id: s.script_id, version: s.version } : null);
 
+/**
+ * Saves the editor script (Ctrl+S). A new or draft script opens a "Save Script"
+ * name dialog; this fills it (optional `name`, default is the strategy()/indicator()
+ * title TradingView pre-fills), clicks save, and waits until the editor is bound
+ * to a saved, non-draft script. Fails instead of reporting success if the dialog
+ * stays open or the script is still unsaved.
+ */
+export async function save({ name, _deps } = {}) {
+  const d = {
+    evaluate, getClient, getEditorScript, ensurePineEditorOpen,
+    sleep: (ms) => new Promise(r => setTimeout(r, ms)),
+    ..._deps,
+  };
+  const editorReady = await d.ensurePineEditorOpen();
+  if (!editorReady) throw new Error('Could not open Pine Editor.');
+
+  const before = await d.getEditorScript();
+  const expectDialog = !before?.script_id || before?.is_draft !== false;
+
+  // Ctrl+S is dispatched to the focused element; if focus is on the chart
+  // (e.g. after another tool ran) the editor never sees it.
+  await d.evaluate(`/*focus-editor*/(function() { var m = ${FIND_MONACO}; if (m) m.editor.focus(); return !!m; })()`);
+  const c = await d.getClient();
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 's', code: 'KeyS' });
+
+  let dialog = { found: false };
+  for (let waited = 0; waited <= (expectDialog ? 3000 : 800); waited += 200) {
+    await d.sleep(200);
+    dialog = (await d.evaluate(saveDialogJs())) || { found: false };
+    if (dialog.found) break;
+  }
+
+  if (dialog.found) {
+    const clicked = (await d.evaluate(saveDialogJs({ click: true, name }))) || {};
+    let after = null, still = { found: true };
+    for (let waited = 0; waited <= 6000; waited += 250) {
+      await d.sleep(250);
+      still = (await d.evaluate(saveDialogJs())) || { found: false };
+      after = await d.getEditorScript();
+      if (!still.found && after?.script_id && after.is_draft === false) break;
+    }
+    if (still.found) {
+      return {
+        success: false, action: 'save_dialog_still_open', dialog_name: clicked.name ?? dialog.name,
+        error: 'The save-name dialog is still open (the name may be empty, invalid, or already taken). Nothing was saved.',
+        editor_script: after,
+      };
+    }
+    if (!after?.script_id || after.is_draft !== false) {
+      return { success: false, action: 'save_unconfirmed', error: 'Clicked save, but the editor script is still unsaved/draft.', editor_script: after };
+    }
+    return { success: true, action: 'saved_new_script', saved_as: scriptRef(after), editor_script: after };
+  }
+
+  // No dialog: a saved script is saved in place as a new version.
+  await d.sleep(500);
+  const after = await d.getEditorScript();
+  if (expectDialog && (!after?.script_id || after.is_draft !== false)) {
+    return {
+      success: false, action: 'save_dialog_not_found',
+      error: 'This is a new/draft script but no save-name dialog appeared, so it was not saved.',
+      editor_script: after,
+    };
+  }
   return {
-    success: true, action: dialogHandled ? 'saved_with_dialog' : 'Ctrl+S_dispatched',
-    editor_script: scriptBefore,
-    ...(scriptBefore?.script_id && { saved_to_script: { name: scriptBefore.name, script_id: scriptBefore.script_id, previous_version: scriptBefore.version } }),
+    success: true, action: 'saved',
+    ...(name && { note: 'name is only used when saving a new script; this saved an existing one.' }),
+    saved_to_script: { name: before?.name, script_id: before?.script_id, previous_version: before?.version, version: after?.version },
+    editor_script: after,
   };
 }
 

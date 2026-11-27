@@ -532,7 +532,33 @@ export async function getStudyValues() {
       return results;
     })()
   `);
-  return { success: true, study_count: data?.length || 0, studies: data || [] };
+  const studies = (data || []).map(s => {
+    const inputs = compactStudyInputs(s.inputs);
+    const out = { id: s.id, name: s.name };
+    if (inputs) out.inputs = inputs;
+    out.values = s.values;
+    return out;
+  });
+  return { success: true, study_count: studies.length, studies };
+}
+
+// Pine study inputs carry the script's encoded source ('text', often 30KB+)
+// and other metadata alongside the user-facing in_N values. Keep only short
+// scalar values so same-name studies stay distinguishable (#143) without
+// bloating the response. {v, f, t} wrappers are flattened to their v.
+const PINE_META_INPUT_KEYS = new Set(['text', 'pineId', 'pineVersion', 'pineFeatures']);
+const MAX_INPUT_STRING_LEN = 64;
+
+export function compactStudyInputs(inputs) {
+  if (!inputs || typeof inputs !== 'object') return null;
+  const out = {};
+  for (const [key, raw] of Object.entries(inputs)) {
+    if (PINE_META_INPUT_KEYS.has(key) || key.startsWith('__')) continue;
+    const v = raw && typeof raw === 'object' && 'v' in raw ? raw.v : raw;
+    if (typeof v === 'number' || typeof v === 'boolean') out[key] = v;
+    else if (typeof v === 'string' && v.length <= MAX_INPUT_STRING_LEN) out[key] = v;
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 export async function getPineLines({ study_filter, verbose } = {}) {
